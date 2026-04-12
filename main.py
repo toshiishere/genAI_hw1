@@ -5,33 +5,116 @@ import re
 import io
 import contextlib
 import os
+import sqlite3
+import json
+import uuid
+from datetime import datetime
 from dotenv import load_dotenv
 
-# Load environment variables from the .env file
+# Load environment variables
 load_dotenv()
+
+# -------------------------------------------------------------------
+# DATABASE FUNCTIONS (LONG-TERM MEMORY)
+# -------------------------------------------------------------------
+DB_FILE = "chat_history.db"
+
+def init_db():
+    """Creates the database and messages table if they don't exist."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_message(session_id, role, content):
+    """Saves a single message to the SQLite database."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # json.dumps ensures we can safely store both text and multimodal lists
+    c.execute('INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)',
+              (session_id, role, json.dumps(content)))
+    conn.commit()
+    conn.close()
+
+def load_messages(session_id):
+    """Retrieves all messages for a specific session."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp ASC', (session_id,))
+    rows = c.fetchall()
+    conn.close()
+    
+    messages = []
+    for row in rows:
+        messages.append({"role": row[0], "content": json.loads(row[1])})
+    return messages
+
+def get_all_sessions():
+    """Returns a list of unique session IDs, ordered by most recent."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT session_id, MAX(timestamp) FROM messages GROUP BY session_id ORDER BY MAX(timestamp) DESC')
+    rows = c.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+# Initialize the database when the app starts
+init_db()
 
 # -------------------------------------------------------------------
 # HELPER FUNCTIONS
 # -------------------------------------------------------------------
 def encode_image(uploaded_file):
-    """Converts the uploaded Streamlit file into a base64 string."""
     return base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
 
 # -------------------------------------------------------------------
-# SIDEBAR: Customization & Features
+# STATE MANAGEMENT
 # -------------------------------------------------------------------
+# Generate a new session ID if one doesn't exist
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# -------------------------------------------------------------------
+# SIDEBAR: Chat History & Settings
+# -------------------------------------------------------------------
+st.sidebar.title("📚 Chat History")
+
+# New Chat Button
+if st.sidebar.button("➕ New Chat"):
+    st.session_state.session_id = str(uuid.uuid4())
+    st.session_state.messages = []
+    st.rerun()
+
+# Load Past Sessions
+st.sidebar.subheader("Previous Sessions")
+past_sessions = get_all_sessions()
+for past_session in past_sessions:
+    # Use the first 8 characters of the UUID as a readable label
+    if st.sidebar.button(f"Session {past_session[:8]}...", key=past_session):
+        st.session_state.session_id = past_session
+        st.session_state.messages = load_messages(past_session)
+        st.rerun()
+
+st.sidebar.divider()
 st.sidebar.title("⚙️ LLM Settings")
 
-# 1. Select the Provider
-provider = st.sidebar.selectbox(
-    "Select Provider", 
-    ["Gemini", "OpenAI", "Local (e.g., Ollama, LM Studio)"]
-)
+provider = st.sidebar.selectbox("Select Provider", ["Gemini", "OpenAI", "Local"])
 
-# 2. Set defaults based on the chosen provider
 if provider == "Gemini":
     default_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    default_model = "gemini-2.5-flash"
+    default_model = "gemini-3-flash"
     default_key = os.getenv("API_KEY_GEMINI", "")
 elif provider == "OpenAI":
     default_url = "https://api.openai.com/v1"
@@ -42,59 +125,20 @@ else:
     default_model = "llama3"
     default_key = ""
 
-# 3. API Configuration
-st.sidebar.subheader("API Configuration")
-api_key = st.sidebar.text_input(
-    f"{provider} API Key", 
-    type="password", 
-    value=default_key,
-    help="Loaded automatically from .env if available."
-)
+api_key = st.sidebar.text_input(f"{provider} API Key", type="password", value=default_key)
 base_url = st.sidebar.text_input("Base URL", value=default_url)
 model_name = st.sidebar.text_input("Model Name", value=default_model)
 
-# 4. Feature Toggles
-st.sidebar.subheader("Advanced Features")
-enable_sandbox = st.sidebar.checkbox(
-    "🐍 Enable Python Sandbox", 
-    value=False, 
-    help="Automatically execute Python code blocks generated by the AI and feed the output back into memory."
-)
-
-# 5. System Prompt / Persona Selection
-st.sidebar.subheader("System Prompt")
-
-# Dictionary of preset personas
-persona_options = {
-    "Brilliant Researcher": "You are a brilliant researcher. You excel at explaining complex topics logically and accurately, particularly in technical fields like machine learning, probability, and advanced algorithms. You provide thorough, step-by-step analytical answers and write exceptionally clean code.",
-    "Friend": "You are a close, supportive friend. You speak casually, use emojis, and are always down to chat about everyday life, anime, music, or a good board game. You are empathetic, warm, and genuinely fun to talk to.",
-    "Mentor": "You are a wise and patient mentor. You don't just give away the answers; you guide the user to understand the underlying concepts themselves. You offer constructive feedback, structure your advice clearly, and encourage continuous growth.",
-    "Custom (Type yourself)": ""
-}
-
-# Dropdown to select persona
-selected_persona = st.sidebar.selectbox("Choose a Persona", list(persona_options.keys()))
-
-# Text area updates based on selection, but remains editable
-if selected_persona == "Custom (Type yourself)":
-    system_prompt = st.sidebar.text_area("Define the AI's behavior:", value="You are a highly capable AI assistant.", height=150)
-else:
-    system_prompt = st.sidebar.text_area("System Prompt (You can still edit this):", value=persona_options[selected_persona], height=150)
+enable_sandbox = st.sidebar.checkbox("🐍 Enable Python Sandbox", value=False)
+system_prompt = st.sidebar.text_area("System Prompt:", value="You are a brilliant researcher.", height=100)
 
 # -------------------------------------------------------------------
-# MAIN UI & SHORT-TERM MEMORY
+# MAIN UI
 # -------------------------------------------------------------------
 st.title("My Personal LLM 🧠")
+st.caption(f"Current Session: `{st.session_state.session_id}`")
 
-# Initialize memory in Streamlit's session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if st.sidebar.button("Clear Chat History"):
-    st.session_state.messages = []
-    st.rerun()
-
-# Render existing conversation (Handling both text and multimodal history)
+# Render existing conversation 
 for message in st.session_state.messages:
     if message["role"] == "system" and message["content"] != system_prompt:
         continue
@@ -110,7 +154,7 @@ for message in st.session_state.messages:
                     st.caption("📎 [Image attached in memory]")
 
 # -------------------------------------------------------------------
-# VISION UPLOAD & CHAT INPUT
+# CHAT INPUT & EXECUTION
 # -------------------------------------------------------------------
 uploaded_image = st.file_uploader("Attach an image (Optional)", type=["jpg", "jpeg", "png"])
 
@@ -127,25 +171,22 @@ if prompt := st.chat_input("What's on your mind?"):
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime_type};base64,{base64_img}"}
-                    }
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_img}"}}
                 ]
             }
         else:
             user_msg = {"role": "user", "content": prompt}
 
+    # Append to memory AND save to database
     st.session_state.messages.append(user_msg)
+    save_message(st.session_state.session_id, "user", user_msg["content"])
 
     with st.chat_message("assistant"):
-        if not api_key and provider != "Local (e.g., Ollama, LM Studio)":
+        if not api_key and provider != "Local":
             st.warning(f"⚠️ Please enter your {provider} API Key.")
         else:
             try:
-                client = OpenAI(api_key=api_key or "local-key-not-needed", base_url=base_url)
-                
-                # Ensure the current system prompt is always injected at the start
+                client = OpenAI(api_key=api_key or "local", base_url=base_url)
                 api_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages
 
                 stream = client.chat.completions.create(
@@ -155,27 +196,30 @@ if prompt := st.chat_input("What's on your mind?"):
                 )
                 full_response = st.write_stream(stream)
                 
+                # Append to memory AND save to database
                 st.session_state.messages.append({"role": "assistant", "content": full_response})
+                save_message(st.session_state.session_id, "assistant", full_response)
 
+                # Sandbox Execution
                 if enable_sandbox:
                     code_blocks = re.findall(r"```python\n(.*?)\n```", full_response, re.DOTALL)
                     for code in code_blocks:
-                        st.info("🔧 Automatically running Python code...")
+                        st.info("🔧 Running Python code...")
                         f = io.StringIO()
                         with contextlib.redirect_stdout(f):
                             try:
                                 exec(code, {})
                                 output = f.getvalue()
                             except Exception as e:
-                                output = f"Error during execution:\n{str(e)}"
+                                output = f"Error:\n{str(e)}"
                         
                         if output.strip():
-                            st.success("📊 Execution Output:")
+                            st.success("📊 Output:")
                             st.code(output)
-                            st.session_state.messages.append({
-                                "role": "system", 
-                                "content": f"System Note: The executed python code resulted in this output:\n{output}"
-                            })
+                            
+                            sys_note = f"System Note: Code executed with output:\n{output}"
+                            st.session_state.messages.append({"role": "system", "content": sys_note})
+                            save_message(st.session_state.session_id, "system", sys_note)
 
             except Exception as e:
                 st.error(f"An error occurred: {e}")
