@@ -8,6 +8,7 @@ import os
 import sqlite3
 import json
 import uuid
+import threading
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -32,8 +33,32 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS long_term_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     conn.commit()
     conn.close()
+
+def save_memory(fact):
+    """Saves an extracted fact to the long-term memory table."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO long_term_memory (fact) VALUES (?)', (fact,))
+    conn.commit()
+    conn.close()
+
+def get_all_memories():
+    """Retrieves all long-term memories."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT fact FROM long_term_memory ORDER BY timestamp ASC')
+    rows = c.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
 
 def save_message(session_id, role, content):
     """Saves a single message to the SQLite database."""
@@ -67,6 +92,14 @@ def get_all_sessions():
     conn.close()
     return [row[0] for row in rows]
 
+def delete_session(session_id):
+    """Deletes all messages for a specific session."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
+    conn.commit()
+    conn.close()
+
 # Initialize the database when the app starts
 init_db()
 
@@ -75,6 +108,26 @@ init_db()
 # -------------------------------------------------------------------
 def encode_image(uploaded_file):
     return base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
+
+def background_memory_update(api_key, base_url, model_name, user_text):
+    """Runs in the background to extract and save important information."""
+    try:
+        client = OpenAI(api_key=api_key or "local", base_url=base_url)
+        sys_prompt = "You are a memory extraction assistant. Extract any new important facts, personal details, or preferences about the user from the message. If there is nothing worth remembering long-term, output exactly 'NONE'. Otherwise, output a concise summary of the fact."
+        
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_text}
+            ],
+            stream=False
+        )
+        fact = response.choices[0].message.content.strip()
+        if fact and fact.upper() != "NONE":
+            save_memory(fact)
+    except Exception:
+        pass # Fail silently in background to avoid disrupting the UI
 
 # -------------------------------------------------------------------
 # STATE MANAGEMENT
@@ -101,11 +154,20 @@ if st.sidebar.button("➕ New Chat"):
 st.sidebar.subheader("Previous Sessions")
 past_sessions = get_all_sessions()
 for past_session in past_sessions:
-    # Use the first 8 characters of the UUID as a readable label
-    if st.sidebar.button(f"Session {past_session[:8]}...", key=past_session):
-        st.session_state.session_id = past_session
-        st.session_state.messages = load_messages(past_session)
-        st.rerun()
+    col1, col2 = st.sidebar.columns([4, 1])
+    with col1:
+        # Use the first 8 characters of the UUID as a readable label
+        if st.button(f"Session {past_session[:8]}...", key=f"load_{past_session}"):
+            st.session_state.session_id = past_session
+            st.session_state.messages = load_messages(past_session)
+            st.rerun()
+    with col2:
+        if st.button("❌", key=f"del_{past_session}"):
+            delete_session(past_session)
+            if st.session_state.session_id == past_session:
+                st.session_state.session_id = str(uuid.uuid4())
+                st.session_state.messages = []
+            st.rerun()
 
 st.sidebar.divider()
 st.sidebar.title("⚙️ LLM Settings")
@@ -186,8 +248,20 @@ if prompt := st.chat_input("What's on your mind?"):
             st.warning(f"⚠️ Please enter your {provider} API Key.")
         else:
             try:
+                # Fire background memory update
+                threading.Thread(
+                    target=background_memory_update, 
+                    args=(api_key, base_url, model_name, prompt),
+                    daemon=True
+                ).start()
+
                 client = OpenAI(api_key=api_key or "local", base_url=base_url)
-                api_messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages
+                
+                memories = get_all_memories()
+                memory_context = ("\n\n### Long-Term Memory ###\n" + "\n".join(f"- {m}" for m in memories)) if memories else ""
+                dynamic_system_prompt = system_prompt + memory_context
+                
+                api_messages = [{"role": "system", "content": dynamic_system_prompt}] + st.session_state.messages
 
                 stream = client.chat.completions.create(
                     model=model_name,
