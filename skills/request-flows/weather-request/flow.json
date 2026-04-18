@@ -1,0 +1,42 @@
+{
+  "display_name": "Weather Skill",
+  "executor": "weather_lookup",
+  "priority": 100,
+  "requires_activation": true,
+  "activation_prompt": "I found the Weather Skill for this request. Would you like to activate it?",
+  "constraints": {
+    "allow_images": false,
+    "allow_audio": false
+  },
+  "match": {
+    "strong_terms": [
+      "weather",
+      "forecast",
+      "temperature",
+      "temp",
+      "humidity",
+      "wind",
+      "umbrella",
+      "hot outside",
+      "cold outside"
+    ],
+    "weak_terms": [
+      "rain",
+      "raining",
+      "snow",
+      "snowing"
+    ],
+    "question_cues": [
+      "what",
+      "how",
+      "will",
+      "is it",
+      "do i need",
+      "should i bring",
+      "outside",
+      "?",
+      "tomorrow",
+      "today"
+    ]
+  }
+}
